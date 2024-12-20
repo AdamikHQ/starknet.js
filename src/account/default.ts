@@ -11,6 +11,7 @@ import { logger } from '../global/logger';
 import { LibraryError, Provider, ProviderInterface } from '../provider';
 import {
   ETransactionVersion,
+  ETransactionVersion2,
   ETransactionVersion3,
   ResourceBounds,
 } from '../provider/types/spec.type';
@@ -30,6 +31,7 @@ import {
   DeclareDeployUDCResponse,
   DeployAccountContractPayload,
   DeployAccountContractTransaction,
+  DeployAccountSignerDetails,
   DeployContractResponse,
   DeployContractUDCResponse,
   DeployTransactionReceiptResponse,
@@ -38,6 +40,7 @@ import {
   EstimateFeeBulk,
   Invocation,
   Invocations,
+  InvocationsDetailsWithNonce,
   InvocationsSignerDetails,
   InvokeFunctionResponse,
   MultiDeployContractResponse,
@@ -55,6 +58,11 @@ import {
   PreparedTransaction,
   PaymasterOptions,
   PaymasterFeeEstimate,
+  V2DeployAccountSignerDetails,
+  V2InvocationsSignerDetails,
+  V3DeployAccountSignerDetails,
+  V3InvocationsSignerDetails,
+  Abi,
 } from '../types';
 import {
   OutsideExecutionVersion,
@@ -68,7 +76,11 @@ import {
 import { CallData } from '../utils/calldata';
 import { extractContractHashes, isSierra } from '../utils/contract';
 import { parseUDCEvent } from '../utils/events';
-import { calculateContractAddressFromHash } from '../utils/hash';
+import {
+  calculateContractAddressFromHash,
+  calculateDeployAccountTransactionHash,
+  calculateInvokeTransactionHash,
+} from '../utils/hash';
 import { isHex, toBigInt, toCairoBool, toHex } from '../utils/num';
 import {
   buildExecuteFromOutsideCall,
@@ -79,6 +91,7 @@ import { parseContract } from '../utils/provider';
 import { supportsInterface } from '../utils/src5';
 import {
   estimateFeeToBounds,
+  intDAM,
   randomAddress,
   reduceV2,
   signatureToHexArray,
@@ -1125,5 +1138,202 @@ export class Account extends Provider implements AccountInterface {
     StarknetIdContract?: string
   ): Promise<string> {
     return super.getStarkName(address, StarknetIdContract);
+  }
+
+  public async getDeployAccountPayloadToSign(
+    {
+      classHash,
+      constructorCalldata = [],
+      addressSalt = 0,
+      contractAddress: providedContractAddress,
+    }: DeployAccountContractPayload,
+    details: UniversalDetails
+  ): Promise<{
+    payload: Omit<DeployAccountContractTransaction, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }> {
+    const version = toTransactionVersion(
+      this.getPreferredVersion(ETransactionVersion.V1, ETransactionVersion.V3),
+      details.version
+    );
+    const nonce = ZERO; // DEPLOY_ACCOUNT transaction will have a nonce zero as it is the first transaction in the account
+    const chainId = await this.getChainId();
+
+    const compiledCalldata = CallData.compile(constructorCalldata);
+    const contractAddress =
+      providedContractAddress ??
+      calculateContractAddressFromHash(addressSalt, classHash, compiledCalldata, 0);
+
+    const estimate = await this.getUniversalSuggestedFee(
+      version,
+      {
+        type: TransactionType.DEPLOY_ACCOUNT,
+        payload: {
+          classHash,
+          constructorCalldata: compiledCalldata,
+          addressSalt,
+          contractAddress,
+        },
+      },
+      details
+    );
+
+    const signaturePayload: DeployAccountSignerDetails = {
+      ...v3Details(details),
+      classHash,
+      constructorCalldata: compiledCalldata,
+      contractAddress,
+      addressSalt,
+      chainId,
+      resourceBounds: estimate.resourceBounds,
+      maxFee: estimate.maxFee,
+      version,
+      nonce,
+    };
+
+    const compiledConstructorCalldata = CallData.compile(signaturePayload.constructorCalldata);
+    /*     const version = BigInt(details.version).toString(); */
+    let msgHash;
+
+    if (Object.values(ETransactionVersion2).includes(details.version as any)) {
+      const det = signaturePayload as V2DeployAccountSignerDetails;
+      msgHash = calculateDeployAccountTransactionHash({
+        ...det,
+        salt: det.addressSalt,
+        constructorCalldata: compiledConstructorCalldata,
+        version: det.version,
+      });
+    } else if (Object.values(ETransactionVersion3).includes(details.version as any)) {
+      const det = signaturePayload as V3DeployAccountSignerDetails;
+      msgHash = calculateDeployAccountTransactionHash({
+        ...det,
+        salt: det.addressSalt,
+        compiledConstructorCalldata,
+        version: det.version,
+        nonceDataAvailabilityMode: intDAM(det.nonceDataAvailabilityMode),
+        feeDataAvailabilityMode: intDAM(det.feeDataAvailabilityMode),
+      });
+    } else {
+      throw Error('unsupported signDeployAccountTransaction version');
+    }
+
+    return {
+      payload: {
+        classHash,
+        addressSalt: addressSalt.toString(),
+        constructorCalldata: signaturePayload.constructorCalldata,
+        toSign: msgHash,
+      },
+      details: {
+        ...v3Details(details),
+        nonce,
+        resourceBounds: estimate.resourceBounds,
+        maxFee: estimate.maxFee,
+        version,
+      },
+    };
+  }
+
+  public async getExecutePayloadToSign(
+    transactions: AllowArray<Call>,
+    transactionsDetail?: UniversalDetails
+  ): Promise<{
+    payload: Omit<Invocation, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }>;
+  public async getExecutePayloadToSign(
+    transactions: AllowArray<Call>,
+    abis?: Abi[],
+    transactionsDetail?: UniversalDetails
+  ): Promise<{
+    payload: Omit<Invocation, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }>;
+  public async getExecutePayloadToSign(
+    transactions: AllowArray<Call>,
+    arg2?: Abi[] | UniversalDetails,
+    transactionsDetail: UniversalDetails = {}
+  ): Promise<{
+    payload: Omit<Invocation, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }> {
+    const details = arg2 === undefined || Array.isArray(arg2) ? transactionsDetail : arg2;
+    const calls = Array.isArray(transactions) ? transactions : [transactions];
+    const nonce = toBigInt(details.nonce ?? (await this.getNonce()));
+    const version = toTransactionVersion(
+      this.getPreferredVersion(ETransactionVersion.V1, ETransactionVersion.V3), // TODO: does this depend on cairo version ?
+      details.version
+    );
+
+    const estimate = await this.getUniversalSuggestedFee(
+      version,
+      { type: TransactionType.INVOKE, payload: transactions },
+      {
+        ...details,
+        version,
+      }
+    );
+
+    const chainId = await this.getChainId();
+
+    const signerDetails: InvocationsSignerDetails = {
+      ...v3Details(details),
+      resourceBounds: estimate.resourceBounds,
+      walletAddress: this.address,
+      nonce,
+      maxFee: estimate.maxFee,
+      version,
+      chainId,
+      cairoVersion: await this.getCairoVersion(),
+    };
+
+    const compiledCalldata = getExecuteCalldata(calls, signerDetails.cairoVersion);
+    let msgHash;
+
+    // TODO: How to do generic union discriminator for all like this
+    if (Object.values(ETransactionVersion2).includes(details.version as any)) {
+      const det = signerDetails as V2InvocationsSignerDetails;
+      msgHash = calculateInvokeTransactionHash({
+        ...det,
+        senderAddress: det.walletAddress,
+        compiledCalldata,
+        version: det.version,
+      });
+    } else if (Object.values(ETransactionVersion3).includes(details.version as any)) {
+      const det = signerDetails as V3InvocationsSignerDetails;
+      msgHash = calculateInvokeTransactionHash({
+        ...det,
+        senderAddress: det.walletAddress,
+        compiledCalldata,
+        version: det.version,
+        nonceDataAvailabilityMode: intDAM(det.nonceDataAvailabilityMode),
+        feeDataAvailabilityMode: intDAM(det.feeDataAvailabilityMode),
+      });
+    } else {
+      throw Error('unsupported signTransaction version');
+    }
+
+    return {
+      payload: {
+        contractAddress: this.address,
+        calldata: compiledCalldata,
+        toSign: msgHash,
+      },
+      details: {
+        ...v3Details(signerDetails),
+        nonce,
+        resourceBounds: estimate.resourceBounds,
+        maxFee: estimate.maxFee,
+        version,
+      },
+    };
   }
 }
