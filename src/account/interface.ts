@@ -18,8 +18,10 @@ import {
   EstimateFeeDetails,
   EstimateFeeResponse,
   EstimateFeeResponseBulk,
+  Invocation,
   Invocations,
   InvocationsDetails,
+  InvocationsDetailsWithNonce,
   InvokeFunctionResponse,
   MultiDeployContractResponse,
   Nonce,
@@ -226,6 +228,49 @@ export abstract class AccountInterface extends ProviderInterface {
     abis?: Abi[],
     transactionsDetail?: InvocationsDetails
   ): Promise<InvokeFunctionResponse>;
+
+  /**
+   * Invoke execute function in account contract
+   *
+   * @param transactions the invocation object or an array of them, containing:
+   * - contractAddress - the address of the contract
+   * - entrypoint - the entrypoint of the contract
+   * - calldata - (defaults to []) the calldata
+   * - signature - (defaults to []) the signature
+   * @param {InvocationsDetails} transactionsDetail Additional optional parameters for the transaction
+   *
+   * @returns response from addTransaction
+   */
+  public abstract getExecutePayloadToSign(
+    transactions: AllowArray<Call>,
+    transactionsDetail?: InvocationsDetails
+  ): Promise<{
+    payload: Omit<Invocation, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }>;
+  /**
+   * @deprecated
+   * @param transactions the invocation object or an array of them, containing:
+   * - contractAddress - the address of the contract
+   * - entrypoint - the entrypoint of the contract
+   * - calldata - (defaults to []) the calldata
+   * - signature - (defaults to []) the signature
+   * @param abis (optional) the abi of the contract for better displaying
+   * @param {InvocationsDetails} transactionsDetail Additional optional parameters for the transaction
+   * * @returns response from addTransaction
+   */
+  public abstract getExecutePayloadToSign(
+    transactions: AllowArray<Call>,
+    abis?: Abi[],
+    transactionsDetail?: InvocationsDetails
+  ): Promise<{
+    payload: Omit<Invocation, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }>;
 
   /**
    * Declares a given compiled contract (json) to starknet
