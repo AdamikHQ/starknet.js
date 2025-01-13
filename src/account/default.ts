@@ -23,6 +23,7 @@ import {
   DeclareDeployUDCResponse,
   DeployAccountContractPayload,
   DeployAccountContractTransaction,
+  DeployAccountSignerDetails,
   DeployContractResponse,
   DeployContractUDCResponse,
   DeployTransactionReceiptResponse,
@@ -31,6 +32,7 @@ import {
   EstimateFeeBulk,
   Invocation,
   Invocations,
+  InvocationsDetailsWithNonce,
   InvocationsSignerDetails,
   InvokeFunctionResponse,
   MultiDeployContractResponse,
@@ -45,7 +47,9 @@ import {
   UniversalDetails,
   UniversalSuggestedFee,
   V2DeployAccountSignerDetails,
+  V2InvocationsSignerDetails,
   V3DeployAccountSignerDetails,
+  V3InvocationsSignerDetails,
 } from '../types';
 import {
   ETransactionVersion,
@@ -65,6 +69,7 @@ import { parseUDCEvent } from '../utils/events';
 import {
   calculateContractAddressFromHash,
   calculateDeployAccountTransactionHash,
+  calculateInvokeTransactionHash,
 } from '../utils/hash';
 import { isHex, toBigInt, toCairoBool, toHex } from '../utils/num';
 import {
@@ -1061,7 +1066,12 @@ export class Account extends Provider implements AccountInterface {
       contractAddress: providedContractAddress,
     }: DeployAccountContractPayload,
     details: UniversalDetails
-  ): Promise<any> {
+  ): Promise<{
+    payload: Omit<DeployAccountContractTransaction, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }> {
     const version = toTransactionVersion(
       this.getPreferredVersion(ETransactionVersion.V1, ETransactionVersion.V3),
       details.version
@@ -1088,7 +1098,7 @@ export class Account extends Provider implements AccountInterface {
       details
     );
 
-    const signaturePayload = {
+    const signaturePayload: DeployAccountSignerDetails = {
       ...v3Details(details),
       classHash,
       constructorCalldata: compiledCalldata,
@@ -1128,9 +1138,115 @@ export class Account extends Provider implements AccountInterface {
     }
 
     return {
-      payload: { classHash, addressSalt, constructorCalldata, toSign: msgHash },
+      payload: {
+        classHash,
+        addressSalt: addressSalt.toString(),
+        constructorCalldata: signaturePayload.constructorCalldata,
+        toSign: msgHash,
+      },
       details: {
         ...v3Details(details),
+        nonce,
+        resourceBounds: estimate.resourceBounds,
+        maxFee: estimate.maxFee,
+        version,
+      },
+    };
+  }
+
+  public async getExecutePayloadToSign(
+    transactions: AllowArray<Call>,
+    transactionsDetail?: UniversalDetails
+  ): Promise<{
+    payload: Omit<Invocation, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }>;
+  public async getExecutePayloadToSign(
+    transactions: AllowArray<Call>,
+    abis?: Abi[],
+    transactionsDetail?: UniversalDetails
+  ): Promise<{
+    payload: Omit<Invocation, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }>;
+  public async getExecutePayloadToSign(
+    transactions: AllowArray<Call>,
+    arg2?: Abi[] | UniversalDetails,
+    transactionsDetail: UniversalDetails = {}
+  ): Promise<{
+    payload: Omit<Invocation, 'signature'> & {
+      toSign: string;
+    };
+    details: InvocationsDetailsWithNonce;
+  }> {
+    const details = arg2 === undefined || Array.isArray(arg2) ? transactionsDetail : arg2;
+    const calls = Array.isArray(transactions) ? transactions : [transactions];
+    const nonce = toBigInt(details.nonce ?? (await this.getNonce()));
+    const version = toTransactionVersion(
+      this.getPreferredVersion(ETransactionVersion.V1, ETransactionVersion.V3), // TODO: does this depend on cairo version ?
+      details.version
+    );
+
+    const estimate = await this.getUniversalSuggestedFee(
+      version,
+      { type: TransactionType.INVOKE, payload: transactions },
+      {
+        ...details,
+        version,
+      }
+    );
+
+    const chainId = await this.getChainId();
+
+    const signerDetails: InvocationsSignerDetails = {
+      ...v3Details(details),
+      resourceBounds: estimate.resourceBounds,
+      walletAddress: this.address,
+      nonce,
+      maxFee: estimate.maxFee,
+      version,
+      chainId,
+      cairoVersion: await this.getCairoVersion(),
+    };
+
+    const compiledCalldata = getExecuteCalldata(calls, signerDetails.cairoVersion);
+    let msgHash;
+
+    // TODO: How to do generic union discriminator for all like this
+    if (Object.values(ETransactionVersion2).includes(details.version as any)) {
+      const det = signerDetails as V2InvocationsSignerDetails;
+      msgHash = calculateInvokeTransactionHash({
+        ...det,
+        senderAddress: det.walletAddress,
+        compiledCalldata,
+        version: det.version,
+      });
+    } else if (Object.values(ETransactionVersion3).includes(details.version as any)) {
+      const det = signerDetails as V3InvocationsSignerDetails;
+      msgHash = calculateInvokeTransactionHash({
+        ...det,
+        senderAddress: det.walletAddress,
+        compiledCalldata,
+        version: det.version,
+        nonceDataAvailabilityMode: intDAM(det.nonceDataAvailabilityMode),
+        feeDataAvailabilityMode: intDAM(det.feeDataAvailabilityMode),
+      });
+    } else {
+      throw Error('unsupported signTransaction version');
+    }
+
+    return {
+      payload: {
+        contractAddress: this.address,
+        calldata: compiledCalldata,
+        toSign: msgHash,
+      },
+      details: {
+        ...v3Details(signerDetails),
         nonce,
         resourceBounds: estimate.resourceBounds,
         maxFee: estimate.maxFee,
